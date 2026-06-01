@@ -133,10 +133,19 @@ cat > "$PLIST" <<'EOF'
 </plist>
 EOF
 launchctl unload "$PLIST" 2>/dev/null || true
+# Kill any stale/duplicate instance of THIS app (match the full binary path, not
+# just the process name) and WAIT for it to fully exit. Otherwise the freshly
+# loaded copy's single-instance lock would see the still-exiting old process and
+# bow out — leaving nothing running.
+APP_BIN="/Applications/FocusOn.app/Contents/MacOS/FocusOn"
+pkill -f "$APP_BIN" 2>/dev/null || true
+for _ in $(seq 1 50); do                       # up to ~5s
+    pgrep -f "$APP_BIN" >/dev/null 2>&1 || break
+    sleep 0.1
+done
+# RunAtLoad=true means loading the agent already launches the app — do NOT also
+# `open` it, or you'd get two menu bar instances.
 launchctl load -w "$PLIST"
-
-echo "==> Launching FocusOn"
-open /Applications/FocusOn.app || true
 
 echo ""
 echo "Done. Look for the shield icon in your menu bar."

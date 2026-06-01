@@ -68,6 +68,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Guards against stacking multiple error alerts.
     private var errorAlertVisible = false
 
+    /// Held open for the process lifetime to enforce a single running instance.
+    private var instanceLockFD: Int32 = -1
+
+    /// Acquires a per-user exclusive lock. Returns false if another instance
+    /// already holds it. The fd is intentionally never closed — the kernel
+    /// releases the lock when this process exits.
+    private func acquireSingleInstanceLock() -> Bool {
+        let path = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("com.focuson.app.lock")
+        let fd = open(path, O_CREAT | O_RDWR, 0o600)
+        if fd < 0 { return true } // can't create a lock file; don't block startup
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd) // another instance holds it
+            return false
+        }
+        instanceLockFD = fd
+        return true
+    }
+
     /// The user's intent: should distracting sites be blocked? Defaults to ON.
     private var shouldBlock: Bool {
         get {
@@ -86,6 +105,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: App lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single instance: take an exclusive lock held for our whole lifetime.
+        // flock is atomic, so even two simultaneous launches resolve to exactly
+        // one winner; the loser exits before creating a second menu bar icon.
+        if !acquireSingleInstanceLock() {
+            NSApp.terminate(nil)
+            return
+        }
+
         NSApp.setActivationPolicy(.accessory) // menu bar only, no Dock icon
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
