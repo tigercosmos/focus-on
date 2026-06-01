@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Shell syntax check
+        run: |
+          for f in helper/focus-blocker install.sh uninstall.sh build.sh scripts/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+
+      - name: Helper tests
+        run: bash scripts/test-helper.sh
+
+      - name: Swift build
+        run: swift build
+
+      - name: Swift unit tests (XCTest)
+        run: swift test
+
+      - name: Assemble app bundle
+        run: ./build.sh

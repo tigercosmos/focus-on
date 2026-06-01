@@ -1,0 +1,6 @@
+# SwiftPM build products
+.build/
+# Assembled app bundle
+build/
+# macOS cruft
+.DS_Store

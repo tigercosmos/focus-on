@@ -1,0 +1,304 @@
+#!/bin/bash
+#
+# focus-blocker — adds/removes a managed block of distracting domains in
+# /etc/hosts. Runs as root, invoked by the FocusOn LaunchDaemon (com.focuson.daemon)
+# whenever the desired-state file or the blocklist changes. Reads its domain
+# list from /usr/local/etc/focus-on/blocklist.txt and the desired state from
+# /usr/local/etc/focus-on/state.
+#
+# Usage: focus-blocker {block|unblock|status|reconcile}
+
+set -euo pipefail
+
+# Fixed PATH: this runs as root, so we must not inherit a caller-controlled
+# PATH that could shadow awk/grep/cat/etc.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Paths are overridable via environment ONLY for the test harness. This is safe
+# in production: launchd spawns the daemon with the plist's environment, which
+# sets none of these variables, so a caller cannot inject them. require_root()
+# below still enforces root for the real /etc/hosts.
+HOSTS="${FOCUS_BLOCKER_HOSTS:-/etc/hosts}"
+BLOCKLIST="${FOCUS_BLOCKER_BLOCKLIST:-/usr/local/etc/focus-on/blocklist.txt}"
+LOCKDIR="${FOCUS_BLOCKER_LOCKDIR:-/var/run/focus-on.lock.d}"
+STATEFILE="${FOCUS_BLOCKER_STATE:-/usr/local/etc/focus-on/state}"
+MARK_START="# >>> focus-on block start (managed by FocusOn) >>>"
+MARK_END="# <<< focus-on block end <<<"
+
+# Bounds on the user-owned blocklist, so a tampered/huge file can't make root
+# build an enormous /etc/hosts (DNS/disk DoS) or read forever.
+MAX_BLOCKLIST_BYTES=1048576   # 1 MiB read cap
+MAX_LINE_LEN=255              # max hostname length
+MAX_HOSTS=5000               # max accepted host entries
+
+# Used for TOCTOU-free reads of the user-owned state/blocklist files.
+PERL=/usr/bin/perl
+
+# Temp files / lock state, cleaned up by the trap below.
+TMP1=""
+TMP2=""
+NEWHOSTS=""
+LOCK_HELD=0
+
+cleanup() {
+    [ -n "$TMP1" ] && rm -f "$TMP1" 2>/dev/null || true
+    [ -n "$TMP2" ] && rm -f "$TMP2" 2>/dev/null || true
+    [ -n "$NEWHOSTS" ] && rm -f "$NEWHOSTS" 2>/dev/null || true
+    rm -rf "${LOCKDIR}.stale.$$" 2>/dev/null || true
+    if [ "$LOCK_HELD" = "1" ]; then
+        rm -f "$LOCKDIR/pid" 2>/dev/null || true
+        rmdir "$LOCKDIR" 2>/dev/null || true
+    fi
+    return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+require_root() {
+    # Editing the real system hosts file needs root; a test-overridden HOSTS
+    # (a temp file the caller already owns) does not.
+    if [ "$HOSTS" = "/etc/hosts" ] && [ "$(id -u)" -ne 0 ]; then
+        echo "focus-blocker: must run as root" >&2
+        exit 1
+    fi
+}
+
+# Serialize hosts mutations so concurrent block/unblock calls can't race.
+# The lock records its holder's PID so a lock left behind by a killed process
+# (EXIT trap didn't run, e.g. SIGKILL/power loss) can be reclaimed instead of
+# wedging every future invocation.
+acquire_lock() {
+    local tries=0 holder
+    while ! mkdir "$LOCKDIR" 2>/dev/null; do
+        holder=""
+        if [ -f "$LOCKDIR/pid" ]; then
+            holder="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+        fi
+        if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+            # Stale holder: atomically move the dir aside so exactly one racer
+            # reclaims it. Because the lock dir still exists until the winning
+            # mv, no new holder can mkdir it in the meantime — so this can never
+            # delete a freshly-acquired lock.
+            if mv "$LOCKDIR" "${LOCKDIR}.stale.$$" 2>/dev/null; then
+                rm -rf "${LOCKDIR}.stale.$$" 2>/dev/null || true
+            fi
+            continue
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            echo "focus-blocker: could not acquire lock ($LOCKDIR)" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+    LOCK_HELD=1
+    printf '%s\n' "$$" > "$LOCKDIR/pid" 2>/dev/null || true
+}
+
+# Remove any orphaned temp hosts files (e.g. from a SIGKILL between mktemp and
+# mv). Safe to call while holding the lock — no other writer is mid-flight.
+sweep_temps() {
+    rm -f "${HOSTS}".focuson.* 2>/dev/null || true
+}
+
+flush_dns() {
+    dscacheutil -flushcache 2>/dev/null || true
+    killall -HUP mDNSResponder 2>/dev/null || true
+}
+
+# TOCTOU-free bounded read of a user-owned file. Opens ONCE with O_NOFOLLOW
+# (a symlinked final component makes open fail) + O_NONBLOCK (a FIFO can't hang
+# the open), then fstat()s the *opened descriptor* and bails unless it is a
+# regular file — so the type check and the read happen on the same inode and a
+# swap between them is impossible. Prints up to $2 bytes; exits non-zero (no
+# output) for a symlink, FIFO, device, missing file, etc.
+read_safe() {
+    "$PERL" -e '
+        use strict;
+        use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK);
+        my ($path, $max) = @ARGV;
+        $max = int($max);
+        sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or exit 3;
+        my @st = stat($fh);                              # fstat on the open fd
+        exit 3 unless @st && ($st[2] & 0170000) == 0100000;  # S_ISREG?
+        my $buf = "";
+        while (length($buf) < $max) {                    # loop: handle short reads
+            my $n = sysread($fh, $buf, $max - length($buf), length($buf));
+            exit 3 unless defined $n;                    # read error
+            last if $n == 0;                             # EOF
+        }
+        print $buf;
+    ' "$1" "$2"
+}
+
+# Emit the (bounded) contents of the blocklist on stdout, refusing symlinks/
+# FIFOs without a race. If perl is unavailable we read nothing rather than
+# re-opening the user-controlled path unsafely (fail closed, never racy).
+read_blocklist_bytes() {
+    if [ -x "$PERL" ]; then
+        read_safe "$BLOCKLIST" "$MAX_BLOCKLIST_BYTES" || true
+    else
+        echo "focus-blocker: $PERL unavailable; not reading blocklist" >&2
+    fi
+}
+
+# Print /etc/hosts with the managed block (markers and everything between) removed.
+strip_block() {
+    awk -v s="$MARK_START" -v e="$MARK_END" '
+        $0 == s { skip = 1; next }
+        $0 == e { skip = 0; next }
+        skip != 1 { print }
+    ' "$HOSTS"
+}
+
+# Drop trailing blank lines from a file, printing the result.
+trim_trailing() {
+    awk '
+        { lines[NR] = $0 }
+        END {
+            n = NR
+            while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+            for (i = 1; i <= n; i++) print lines[i]
+        }
+    ' "$1"
+}
+
+# A minimal, safe default hosts body, used only if stripping our block would
+# otherwise leave an empty file (so unblock can never fail to remove the block).
+write_default_hosts() {
+    {
+        printf '##\n# Host Database\n##\n'
+        printf '127.0.0.1\tlocalhost\n'
+        printf '255.255.255.255\tbroadcasthost\n'
+        printf '::1\tlocalhost\n'
+    } > "$1"
+}
+
+# Emit "0.0.0.0 host" / ":: host" lines for each valid entry in the blocklist,
+# bounded by size, line length, and host count. Skips the file entirely if it
+# is missing, a symlink, or not a regular file (so root never follows a planted
+# symlink into another file).
+emit_block_entries() {
+    local count=0 line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [ -z "$line" ]; then continue; fi
+        case "$line" in \#*) continue ;; esac
+        if [ "${#line}" -gt "$MAX_LINE_LEN" ]; then continue; fi
+        if printf '%s' "$line" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+            echo "0.0.0.0 $line"
+            echo ":: $line"
+            count=$((count + 1))
+            if [ "$count" -ge "$MAX_HOSTS" ]; then
+                echo "focus-blocker: blocklist truncated at $MAX_HOSTS hosts" >&2
+                break
+            fi
+        fi
+    done < <(read_blocklist_bytes)
+}
+
+# Atomically replace /etc/hosts with the contents of $1.
+# Writes a sibling temp file (same filesystem), fixes ownership/mode, then
+# rename()s it into place so a crash mid-write can never truncate hosts.
+write_hosts() {
+    local src="$1"
+    if [ ! -s "$src" ]; then
+        echo "focus-blocker: refusing to write an empty hosts file" >&2
+        exit 1
+    fi
+    NEWHOSTS="$(mktemp "${HOSTS}.focuson.XXXXXX")"
+    cat "$src" > "$NEWHOSTS"
+    chown root:wheel "$NEWHOSTS" 2>/dev/null || true
+    chmod 644 "$NEWHOSTS"
+    mv -f "$NEWHOSTS" "$HOSTS"
+    NEWHOSTS=""
+}
+
+cmd_block() {
+    require_root
+    acquire_lock
+    sweep_temps
+    TMP1="$(mktemp)"
+    TMP2="$(mktemp)"
+
+    strip_block > "$TMP1"               # remove any existing managed block
+    trim_trailing "$TMP1" > "$TMP2"     # tidy base
+
+    {
+        echo ""
+        echo "$MARK_START"
+        emit_block_entries
+        echo "$MARK_END"
+    } >> "$TMP2"
+
+    # No-op if /etc/hosts already matches — keeps the periodic reconcile from
+    # churning hosts / flushing DNS when nothing changed.
+    if cmp -s "$TMP2" "$HOSTS"; then
+        echo "blocked"
+        return 0
+    fi
+    write_hosts "$TMP2"
+    flush_dns
+    echo "blocked"
+}
+
+cmd_unblock() {
+    require_root
+    acquire_lock
+    sweep_temps
+    TMP1="$(mktemp)"
+    TMP2="$(mktemp)"
+
+    strip_block > "$TMP1"
+    trim_trailing "$TMP1" > "$TMP2"
+
+    # If the file held nothing but our managed block, restore a safe default
+    # rather than refusing to write (which would leave the block in place).
+    if [ ! -s "$TMP2" ]; then
+        write_default_hosts "$TMP2"
+    fi
+
+    if cmp -s "$TMP2" "$HOSTS"; then
+        echo "unblocked"
+        return 0
+    fi
+    write_hosts "$TMP2"
+    flush_dns
+    echo "unblocked"
+}
+
+cmd_status() {
+    if grep -qF "$MARK_START" "$HOSTS" 2>/dev/null; then
+        echo "blocked"
+    else
+        echo "unblocked"
+    fi
+}
+
+# Read the desired-state file and bring /etc/hosts in line with it. This is the
+# entry point the LaunchDaemon runs (as root) whenever the state file or the
+# blocklist changes, and at load/boot. Defaults to "block" (fail safe toward
+# focus) when the state file is missing, unreadable, or not a regular file.
+# The read is bounded and refuses symlinks/FIFOs.
+cmd_reconcile() {
+    local want=""
+    if [ -x "$PERL" ]; then
+        want="$(read_safe "$STATEFILE" 64 | head -n1 | tr -d '[:space:]' || true)"
+    fi
+    # If perl is unavailable, want stays "" and we default to block — we never
+    # re-open the user-controlled state path unsafely. Fail safe toward focus.
+    case "$want" in
+        unblock) cmd_unblock ;;
+        *)       cmd_block ;;
+    esac
+}
+
+case "${1:-}" in
+    block)     cmd_block ;;
+    unblock)   cmd_unblock ;;
+    status)    cmd_status ;;
+    reconcile) cmd_reconcile ;;
+    *) echo "usage: focus-blocker {block|unblock|status|reconcile}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,33 @@
+# FocusOn blocklist — one domain per line.
+# Lines starting with '#' and blank lines are ignored.
+# After editing, choose "Reload Blocklist" from the menu (or toggle off/on)
+# to apply your changes.
+
+# Threads
+threads.net
+www.threads.net
+threads.com
+www.threads.com
+
+# Facebook
+facebook.com
+www.facebook.com
+m.facebook.com
+web.facebook.com
+fb.com
+www.fb.com
+fb.me
+fb.watch
+
+# X / Twitter
+x.com
+www.x.com
+twitter.com
+www.twitter.com
+mobile.twitter.com
+t.co
+
+# Instagram
+instagram.com
+www.instagram.com
+m.instagram.com
